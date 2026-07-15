@@ -1,0 +1,44 @@
+name: Codex quota reset monitor
+
+on:
+  schedule:
+    # The source site refreshes around :09 and :39 each hour.
+    - cron: "12,42 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-quota-reset-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out monitor
+        uses: actions/checkout@v4
+
+      - name: Restore notification state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: codex-reset-state-${{ github.run_id }}
+          restore-keys: |
+            codex-reset-state-
+
+      - name: Check reset signals
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: ./monitor.ps1
+
+      - name: Save notification state
+        if: ${{ always() && hashFiles('state.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: codex-reset-state-${{ github.run_id }}
