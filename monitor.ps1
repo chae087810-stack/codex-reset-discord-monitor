@@ -243,6 +243,24 @@ function Resolve-TiboPost {
     return $null
 }
 
+function Test-IsPostClassificationConflict {
+    param([AllowNull()][object]$Post, [AllowNull()][object[]]$HistoryEntries = @())
+    if ($null -eq $Post) { return $false }
+    $strength = [int]$Post.tweetAssessment.resetSignalStrength
+    $reason = [string]$Post.tweetAssessment.reason
+    if ($strength -gt 0 -and $reason -notmatch '(?i)no .*(?:reset|limits?)|unrelated|무관') { return $false }
+
+    $postGuid = [string]$Post.guid
+    foreach ($entry in @($HistoryEntries)) {
+        foreach ($change in @($entry.changes | Where-Object { [string]$_.label -eq "confirmed reset" })) {
+            foreach ($detail in @($change.details | Where-Object { [string]$_.kind -eq "tweet" })) {
+                if ((Get-TweetGuidFromUrl -Url ([string]$detail.url)) -eq $postGuid) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
 function Get-TiboTitle {
     param(
         [AllowNull()][object]$Post,
@@ -283,6 +301,18 @@ function Send-TiboNotification {
     $translation = Get-KoreanTranslation -Text $original
     $description = Format-BilingualPost -Original $original -Korean $translation
     $fields = [System.Collections.Generic.List[object]]::new()
+    $category = if ($null -ne $Post) { [string]$Post.tweetAssessment.category } else { "site_history_source" }
+    $reason = if ($null -ne $Post) { [string]$Post.tweetAssessment.reason } else { "" }
+
+    # Safety fields come first so Discord's aggregate length limit can never
+    # hide the contradiction/applicability warning behind long post context.
+    if ($ClassificationConflict) {
+        $fields.Add([ordered]@{
+            name = "⚠️ 사이트 내부 판정 모순"
+            value = "Recent Movement는 이 글을 리셋 근거로 기록했지만, 현재 트윗 판정은 신호 강도 0 또는 ‘무관함’으로 설명합니다. **리셋으로 해석하지 마세요.**"
+            inline = $false
+        })
+    }
 
     if ($null -ne $Post -and -not [string]::IsNullOrWhiteSpace([string]$Post.context)) {
         $fields.Add([ordered]@{
@@ -292,8 +322,6 @@ function Send-TiboNotification {
         })
     }
 
-    $category = if ($null -ne $Post) { [string]$Post.tweetAssessment.category } else { "site_history_source" }
-    $reason = if ($null -ne $Post) { [string]$Post.tweetAssessment.reason } else { "" }
     $classification = "분류: ``$category``"
     if ($null -ne $Post -and $null -ne $Post.tweetAssessment.resetSignalStrength) {
         $classification += "`n신호 강도: **$([int]$Post.tweetAssessment.resetSignalStrength)** (확률 아님)"
@@ -309,14 +337,6 @@ function Send-TiboNotification {
         $fields.Add([ordered]@{
             name = "Recent Movement의 설명"
             value = Limit-Text -Text $HistoryReason -MaxLength 1024
-            inline = $false
-        })
-    }
-
-    if ($ClassificationConflict) {
-        $fields.Add([ordered]@{
-            name = "⚠️ 사이트 내부 판정 모순"
-            value = "Recent Movement는 이 글을 리셋 근거로 기록했지만, 현재 트윗 판정은 신호 강도 0 또는 ‘무관함’으로 설명합니다. **리셋으로 해석하지 마세요.**"
             inline = $false
         })
     }
@@ -364,7 +384,9 @@ function Send-HistoryNotification {
         [object]$Entry,
         [hashtable]$NotifiedSignals,
         [switch]$IsRevision,
-        [switch]$IsTest
+        [switch]$IsTest,
+        [scriptblock]$AfterHistorySent = $null,
+        [scriptblock]$AfterSignalSent = $null
     )
 
     $fromScore = [int]$Entry.fromScore
@@ -477,6 +499,7 @@ function Send-HistoryNotification {
             -Fields ([object[]]$fieldChunks[$chunkIndex])
         Send-DiscordEmbeds -Embeds @($embed)
     }
+    if ($null -ne $AfterHistorySent) { & $AfterHistorySent }
 
     foreach ($change in @($Entry.changes)) {
         $historyReason = @($change.details | Where-Object { [string]$_.action -eq "Why it counted" } | ForEach-Object { [string]$_.name }) -join " "
@@ -494,6 +517,7 @@ function Send-HistoryNotification {
                     -ClassificationConflict:$classificationConflict `
                     -IsTest:$IsTest
                 $NotifiedSignals[$signalId] = $true
+                if ($null -ne $AfterSignalSent) { & $AfterSignalSent $signalId }
                 Write-MonitorLog "Sent Tibo source $signalId for history $(Get-HistoryId -Entry $Entry)."
             }
         }
@@ -683,10 +707,17 @@ foreach ($entry in $historyEntries) {
         continue
     }
 
-    Send-HistoryNotification -Entry $entry -NotifiedSignals $seenSignals -IsRevision:$isRevision
-    $seenHistory[$historyId] = $true
-    $historyFingerprints[$historyId] = $fingerprint
-    Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    $afterHistorySent = {
+        $seenHistory[$historyId] = $true
+        $historyFingerprints[$historyId] = $fingerprint
+        Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    }
+    $afterSignalSent = {
+        param([string]$DeliveredSignalId)
+        $seenSignals[$DeliveredSignalId] = $true
+        Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    }
+    Send-HistoryNotification -Entry $entry -NotifiedSignals $seenSignals -IsRevision:$isRevision -AfterHistorySent $afterHistorySent -AfterSignalSent $afterSignalSent
     Write-MonitorLog "Sent site history $historyId (revision=$isRevision)."
 }
 
@@ -694,7 +725,8 @@ foreach ($post in $signalPosts) {
     $signalId = Get-TweetId -Post $post
     if (-not $signalId -or $seenSignals.ContainsKey($signalId)) { continue }
 
-    Send-TiboNotification -Post $post -SourceLabel "현재 forecast 근거"
+    $signalConflict = Test-IsPostClassificationConflict -Post $post -HistoryEntries $historyEntries
+    Send-TiboNotification -Post $post -SourceLabel "현재 forecast/Recent Movement 근거" -ClassificationConflict:$signalConflict
     $seenSignals[$signalId] = $true
     Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
     Write-MonitorLog "Sent site-selected Tibo signal $signalId."

@@ -17,7 +17,9 @@ function Save-Fixture {
 }
 
 function Invoke-DryRun {
-    return (& $Monitor -DryRun -ForecastFile $Fixture -StateFile $State *>&1 | Out-String)
+    $output = & $Monitor -DryRun -ForecastFile $Fixture -StateFile $State *>&1 | Out-String
+    if (-not $?) { throw "Monitor dry run failed: $output" }
+    return $output
 }
 
 function Get-Payloads {
@@ -191,11 +193,11 @@ try {
         guid = "1003"
         link = "https://x.com/thsottiaux/status/1003"
         pubDate = "2026-07-19T00:30:00.000Z"
-        title = "The sun came out"
-        context = "Unrelated conversation"
+        title = "The sun came out " + ("y" * 4000)
+        context = "Unrelated conversation " + ("c" * 4000)
         tweetAssessment = [ordered]@{
             category = "reset_completed"
-            reason = "No Codex reset mention; unrelated."
+            reason = "No Codex reset mention; unrelated. " + ("r" * 4000)
             resetSignalStrength = 0
         }
     }
@@ -211,7 +213,7 @@ try {
             to = 42
             details = @(
                 [ordered]@{ kind = "tweet"; action = "Source post"; name = $conflictPost.title; url = $conflictPost.link },
-                [ordered]@{ action = "Why it counted"; name = "Explicit completed Codex quota-reset post." }
+                [ordered]@{ action = "Why it counted"; name = "Explicit completed Codex quota-reset post. " + ("h" * 4000) }
             )
         })
     }
@@ -226,6 +228,8 @@ try {
     Assert-True ([int]$conflictPayloads[0].embeds[0].color -eq 15105570) "The contradictory site classification was not rendered as a warning."
     Assert-True ([string]$conflictPayloads[1].embeds[0].description -match "The sun came out") "The contradictory Tibo original was hidden."
     Assert-True ((@($conflictPayloads[1].embeds[0].fields | ForEach-Object { [string]$_.value }) -join " ") -match "No Codex reset mention; unrelated") "The current contradictory model reason was hidden."
+    Assert-True (@($conflictPayloads[1].embeds[0].fields).Count -ge 2) "Long Tibo content removed a safety field."
+    Assert-True ([string]$conflictPayloads[1].embeds[0].fields[0].value -match "Recent Movement") "The contradiction warning was not prioritized under Discord's length limit."
 
     Remove-Item -LiteralPath $State -Force
     [ordered]@{
