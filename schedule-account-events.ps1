@@ -97,16 +97,17 @@ if ($expiry -gt $now) {
     } else {
         $consumeTriggers += New-ScheduledTaskTrigger -Once -At $now.AddSeconds(5)
     }
-    $oneMinuteAt = $expiry.AddMinutes(-1)
-    if ($oneMinuteAt -gt $now.AddSeconds(8)) {
-        $consumeTriggers += New-ScheduledTaskTrigger -Once -At $oneMinuteAt
+    foreach ($safetyWakeAt in @($expiry.AddMinutes(-3), $expiry.AddMinutes(-2))) {
+        if ($safetyWakeAt -gt $now.AddSeconds(8)) {
+            $consumeTriggers += New-ScheduledTaskTrigger -Once -At $safetyWakeAt
+        }
     }
     $consumeTask = New-ScheduledTask `
         -Action $consumeAction `
         -Trigger $consumeTriggers `
         -Principal $principal `
         -Settings $consumeSettings `
-        -Description "Prepares five minutes early, wakes again at T-1, and uses the actual Codex reset ticket one minute before expiry."
+        -Description "Prepares at T-5, adds T-3/T-2 safety wakes, and uses the actual Codex reset ticket at T-1."
     Register-ScheduledTask -TaskName $consumeTaskName -InputObject $consumeTask -Force | Out-Null
 } else {
     Remove-MonitorTask -TaskName $consumeTaskName
