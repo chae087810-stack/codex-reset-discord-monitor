@@ -141,7 +141,9 @@ try {
     $completedOutput = Invoke-DryRun
     $completedPayloads = @(Get-Payloads -Output $completedOutput)
     Assert-True ($completedPayloads.Count -eq 2) "Expected one completed-reset history payload and one source-post payload."
-    Assert-True ([string]$completedPayloads[0].embeds[0].timestamp -match "2026-07-19T00:10:00") "The embed timestamp did not use the site event time."
+    $actualCompletedTimestamp = ([DateTime]$completedPayloads[0].embeds[0].timestamp).ToUniversalTime()
+    $expectedCompletedTimestamp = ([DateTime]"2026-07-19T00:10:00.000Z").ToUniversalTime()
+    Assert-True ($actualCompletedTimestamp -eq $expectedCompletedTimestamp) "The embed timestamp did not use the site event time."
     Assert-True ([string]$completedPayloads[1].embeds[0].fields[0].value -match "reset_completed") "The completed category was not shown."
     Assert-True ([string]$completedPayloads[1].embeds[0].description -match "Enjoy reset usage limits") "The completed Tibo original was not shown."
 
