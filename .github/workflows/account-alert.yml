@@ -1,0 +1,65 @@
+name: Relay actual Codex account alert
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_b64:
+        description: Base64-encoded Discord payload from the local account monitor
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-account-alert-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Validate and send Discord payload
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_PAYLOAD_B64: ${{ inputs.payload_b64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DISCORD_WEBHOOK_URL)) {
+            throw 'DISCORD_WEBHOOK_URL is not configured.'
+          }
+
+          $bytes = [Convert]::FromBase64String($env:DISCORD_PAYLOAD_B64)
+          if ($bytes.Length -gt 30000) {
+            throw 'Discord payload is unexpectedly large.'
+          }
+          $json = [Text.Encoding]::UTF8.GetString($bytes)
+          $payload = $json | ConvertFrom-Json
+          if ($null -eq $payload.embeds -or @($payload.embeds).Count -ne 1) {
+            throw 'Expected exactly one Discord embed.'
+          }
+          if ([string]::IsNullOrWhiteSpace([string]$payload.embeds[0].title)) {
+            throw 'Discord embed title is required.'
+          }
+
+          $delays = @(0, 2, 5, 10)
+          for ($attempt = 0; $attempt -lt $delays.Count; $attempt++) {
+            if ($delays[$attempt] -gt 0) {
+              Start-Sleep -Seconds $delays[$attempt]
+            }
+            try {
+              Invoke-RestMethod `
+                -Uri $env:DISCORD_WEBHOOK_URL `
+                -Method Post `
+                -ContentType 'application/json; charset=utf-8' `
+                -Body $json | Out-Null
+              break
+            } catch {
+              if ($attempt -eq $delays.Count - 1) {
+                throw
+              }
+              Write-Warning "Discord delivery attempt $($attempt + 1) failed; retrying."
+            }
+          }
