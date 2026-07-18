@@ -1,3 +1,4 @@
 .webhook
 state.json
 monitor.log
+.protocol-ts-temp/

@@ -38,7 +38,9 @@ jobs:
 
       - name: Test monitor logic
         shell: pwsh
-        run: ./tests/run.ps1
+        run: |
+          ./tests/run.ps1
+          node --test ./tests/account-monitor.test.mjs
 
       - name: Check reset signals
         shell: pwsh
