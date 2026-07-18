@@ -1,52 +1,168 @@
-﻿param([switch]$TestTranslation)
+﻿param(
+    [switch]$TestTranslation,
+    [switch]$TestLatestLog,
+    [string]$ForecastFile = "",
+    [string]$StateFile = "",
+    [switch]$DryRun
+)
 
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WebhookPath = Join-Path $Root ".webhook"
-$StatePath = Join-Path $Root "state.json"
+$StatePath = if ($StateFile) { $StateFile } else { Join-Path $Root "state.json" }
 $LogPath = Join-Path $Root "monitor.log"
 $ForecastUrl = "https://www.willcodexquotareset.com/api/forecast"
+$SiteUrl = "https://www.willcodexquotareset.com/"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Limit-Text {
+    param([AllowNull()][string]$Text, [int]$MaxLength)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    if ($Text.Length -le $MaxLength) { return $Text }
+    return $Text.Substring(0, [Math]::Max(0, $MaxLength - 3)) + "..."
+}
 
 function Write-MonitorLog {
     param([string]$Message)
     $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
 }
 
-function Send-DiscordEmbed {
+function Convert-ToDateTimeOffset {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return [DateTimeOffset]::UtcNow
+    }
+    if ($Value -is [DateTimeOffset]) { return $Value }
+    if ($Value -is [DateTime]) {
+        $dateValue = [DateTime]$Value
+        if ($dateValue.Kind -eq [DateTimeKind]::Unspecified) {
+            $dateValue = [DateTime]::SpecifyKind($dateValue, [DateTimeKind]::Utc)
+        }
+        return [DateTimeOffset]$dateValue
+    }
+    return [DateTimeOffset]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal
+    )
+}
+
+function Convert-ToIsoUtc {
+    param([AllowNull()][object]$Value)
+    return (Convert-ToDateTimeOffset -Value $Value).ToUniversalTime().ToString("o")
+}
+
+function Get-KoreaTimeZone {
+    if ($script:KoreaTimeZone) { return $script:KoreaTimeZone }
+    foreach ($id in @("Asia/Seoul", "Korea Standard Time")) {
+        try {
+            $script:KoreaTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($id)
+            return $script:KoreaTimeZone
+        } catch { }
+    }
+    throw "Could not locate the Korea time zone."
+}
+
+function Format-KstTime {
+    param([AllowNull()][object]$Value)
+    $dateValue = Convert-ToDateTimeOffset -Value $Value
+    $kst = [TimeZoneInfo]::ConvertTime($dateValue, (Get-KoreaTimeZone))
+    return $kst.ToString("yyyy-MM-dd HH:mm:ss 'KST'")
+}
+
+function New-DiscordEmbed {
     param(
         [string]$Title,
         [string]$Description,
         [string]$Url = "",
         [int]$Color = 5793266,
-        [string]$Footer = "Codex quota watcher"
+        [AllowNull()][object]$EventAt = $null,
+        [string]$Footer = "Codex quota watcher",
+        [AllowNull()][object[]]$Fields = @()
     )
 
+    $safeTitle = Limit-Text -Text $Title -MaxLength 256
+    $safeDescription = Limit-Text -Text $Description -MaxLength 4096
+    $safeFooter = Limit-Text -Text $Footer -MaxLength 2048
     $embed = [ordered]@{
-        title = $Title
-        description = if ($Description.Length -gt 4000) { $Description.Substring(0, 3997) + "..." } else { $Description }
+        title = $safeTitle
+        description = $safeDescription
         color = $Color
-        timestamp = (Get-Date).ToUniversalTime().ToString("o")
-        footer = @{ text = $Footer }
+        timestamp = Convert-ToIsoUtc -Value $EventAt
+        footer = @{ text = $safeFooter }
     }
     if ($Url) { $embed.url = $Url }
+    if (@($Fields).Count -gt 0) {
+        # Discord limits all textual content in one embed to 6,000 characters.
+        $remaining = 5900 - $safeTitle.Length - $safeDescription.Length - $safeFooter.Length
+        $safeFields = [System.Collections.Generic.List[object]]::new()
+        foreach ($field in @($Fields | Select-Object -First 25)) {
+            if ($remaining -le 2) { break }
+            $fieldName = Limit-Text -Text ([string]$field.name) -MaxLength ([Math]::Min(256, $remaining - 1))
+            $remaining -= $fieldName.Length
+            if ($remaining -le 1) { break }
+            $fieldValue = Limit-Text -Text ([string]$field.value) -MaxLength ([Math]::Min(1024, $remaining))
+            $remaining -= $fieldValue.Length
+            $safeFields.Add([ordered]@{ name = $fieldName; value = $fieldValue; inline = [bool]$field.inline })
+        }
+        if ($safeFields.Count -gt 0) { $embed.fields = @($safeFields) }
+    }
+    return $embed
+}
 
-    $payload = [ordered]@{
-        username = "Codex 리셋 알림"
-        embeds = @($embed)
-    } | ConvertTo-Json -Depth 8 -Compress
+function Send-DiscordEmbeds {
+    param([object[]]$Embeds)
 
-    $body = [Text.Encoding]::UTF8.GetBytes($payload)
-    Invoke-RestMethod -Uri $script:WebhookUrl -Method Post -ContentType "application/json; charset=utf-8" -Body $body | Out-Null
+    foreach ($embed in @($Embeds)) {
+        $payloadObject = [ordered]@{
+            username = "Codex 리셋 알림"
+            embeds = @($embed)
+        }
+        $payload = $payloadObject | ConvertTo-Json -Depth 12 -Compress
+
+        if ($DryRun) {
+            Write-Output ("DRYRUN_PAYLOAD {0}" -f $payload)
+            continue
+        }
+
+        $body = [Text.Encoding]::UTF8.GetBytes($payload)
+        $sent = $false
+        for ($attempt = 1; $attempt -le 4 -and -not $sent; $attempt++) {
+            try {
+                Invoke-RestMethod -Uri $script:WebhookUrl -Method Post -ContentType "application/json; charset=utf-8" -Body $body | Out-Null
+                $sent = $true
+            } catch {
+                $statusCode = 0
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+                $retryable = $statusCode -eq 429 -or $statusCode -ge 500 -or $statusCode -eq 0
+                if (-not $retryable -or $attempt -eq 4) { throw }
+
+                $delaySeconds = [Math]::Min(8, [Math]::Pow(2, $attempt - 1))
+                if ($statusCode -eq 429 -and $_.ErrorDetails.Message) {
+                    try {
+                        $retryBody = $_.ErrorDetails.Message | ConvertFrom-Json
+                        if ($null -ne $retryBody.retry_after) {
+                            $delaySeconds = [Math]::Min(10, [Math]::Max(1, [double]$retryBody.retry_after))
+                        }
+                    } catch { }
+                }
+                Write-MonitorLog "Discord delivery retry $attempt after HTTP $statusCode; waiting $delaySeconds second(s)."
+                Start-Sleep -Milliseconds ([int]($delaySeconds * 1000))
+            }
+        }
+    }
 }
 
 function Get-KoreanTranslation {
     param([string]$Text)
 
     if ([string]::IsNullOrWhiteSpace($Text)) { return "(본문 없음)" }
+    if ($DryRun) { return "[테스트 번역] $Text" }
 
     try {
         $response = Invoke-RestMethod `
@@ -67,106 +183,437 @@ function Get-KoreanTranslation {
         Write-MonitorLog ("Translation failed: {0}" -f $_.Exception.Message)
     }
 
-    return "⚠️ 자동 번역을 가져오지 못했습니다. 원문 알림은 정상적으로 전송됐습니다."
-}
-
-function Limit-PostSection {
-    param([string]$Text, [int]$MaxLength = 1800)
-    if ([string]::IsNullOrWhiteSpace($Text)) { return "(본문 없음)" }
-    if ($Text.Length -le $MaxLength) { return $Text }
-    return $Text.Substring(0, $MaxLength - 3) + "..."
+    return "⚠️ 자동 번역을 가져오지 못했습니다. 원문과 링크는 정상입니다."
 }
 
 function Format-BilingualPost {
     param([string]$Original, [string]$Korean)
-    $originalSection = Limit-PostSection -Text $Original
-    $koreanSection = Limit-PostSection -Text $Korean
-    return "🇺🇸 **원문**`n$originalSection`n`n🇰🇷 **한글 번역**`n$koreanSection"
+    $originalSection = Limit-Text -Text $Original -MaxLength 1350
+    $koreanSection = Limit-Text -Text $Korean -MaxLength 1350
+    return "🇺🇸 **Tibo 원문**`n$originalSection`n`n🇰🇷 **한글 번역**`n$koreanSection"
 }
 
-function Get-PostKind {
-    param([string]$Text)
-    if ($Text -match '(?i)banked reset|apply the reset|replenish the weekly usage') {
-        return @{ Title = "🎟️ Codex 리셋 쿠폰 지급"; Color = 16753920 }
-    }
-    if ($Text -match "(?is)\b(?:will|we['’]ll|going to|plan(?:ning)? to|about to|scheduled to|expect(?:ed)? to)\b.{0,100}\b(?:reset|refill)\b|\b(?:reset|refill)\b.{0,80}\b(?:soon|later|tomorrow)\b") {
-        return @{ Title = "⏳ Tibo의 Codex 리셋 예고"; Color = 16753920 }
-    }
-    return @{ Title = "🔮 Codex 리셋 확률 상승 떡밥"; Color = 10181046 }
+function Get-TweetGuidFromUrl {
+    param([AllowNull()][string]$Url)
+    if ($Url -match '/status/(\d+)') { return [string]$Matches[1] }
+    return ""
 }
 
-function Test-IsResetRelatedPost {
-    param([object]$Post, [hashtable]$SiteSignalTweetUrls)
+function Get-HistoryId {
+    param([object]$Entry)
+    return "hist:v2:{0}:{1}:{2}" -f (Convert-ToIsoUtc -Value $Entry.at), [int]$Entry.fromScore, [int]$Entry.toScore
+}
 
-    $text = [string]$Post.title
-    $url = [string]$Post.link
+function Get-HistoryFingerprint {
+    param([object]$Entry)
 
-    # Prefer Tibo tweets that the forecast site recorded as a positive signal.
-    # Confirmed/completed resets reduce the forecast and are excluded here.
-    if ($url -and $SiteSignalTweetUrls.ContainsKey($url)) { return $true }
-
-    # The site currently treats banked-reset coupons as event hints, so retain
-    # a narrow text check for those without accepting general Tibo chatter.
-    if ($text -match '(?is)\bbanked\s+reset\b|\bapply\s+(?:the|your)\s+reset\b|\breplenish\b.{0,100}\bweekly\s+usage\b|\breset\s+coupon\b') {
-        return $true
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add("$(Convert-ToIsoUtc -Value $Entry.at)|$([int]$Entry.fromScore)|$([int]$Entry.scoreDelta)|$([int]$Entry.toScore)")
+    foreach ($change in @($Entry.changes | Sort-Object { "{0}|{1}|{2}|{3}" -f [string]$_.label, [int]$_.from, [int]$_.delta, [int]$_.to })) {
+        $parts.Add("change|$([string]$change.label)|$([int]$change.from)|$([int]$change.delta)|$([int]$change.to)")
+        foreach ($detail in @($change.details | Sort-Object { "{0}|{1}|{2}|{3}" -f [string]$_.kind, [string]$_.action, [string]$_.name, [string]$_.url })) {
+            $parts.Add("detail|$([string]$detail.kind)|$([string]$detail.action)|$([string]$detail.name)|$([string]$detail.url)")
+        }
     }
 
-    # Mirror both of the site's rules as a fallback: the post must mention a
-    # quota/limit reset and explicitly put that reset in the future.
-    $mentionsQuotaReset = $text -match '(?is)\b(?:reset|resetting|refill)\b.{0,180}\b(?:usage|limits?|quotas?|tokens?)\b|\b(?:usage|limits?|quotas?|tokens?)\b.{0,180}\b(?:reset|resetting|refill)\b'
-    $promisesFutureReset = $text -match "(?is)\b(?:will|we['’]ll|going to|plan(?:ning)? to|about to|scheduled to|expect(?:ed)? to)\s+(?:be\s+)?(?:reset|resetting|refill)\b|\bgive\s+(?:us|me)\s+(?:up to\s+)?(?:\d+\s*)?(?:minutes?|hours?|days?)\s+to\s+(?:reset|refill)\b|\b(?:reset|refill)\b.{0,80}\b(?:soon|later|tomorrow|within\s+\d+|in\s+\d+\s+(?:minutes?|hours?|days?))\b"
-    return $mentionsQuotaReset -and $promisesFutureReset
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($parts -join "`n")
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $sha.Dispose()
+    }
 }
 
-$script:WebhookUrl = [Environment]::GetEnvironmentVariable("DISCORD_WEBHOOK_URL")
-if ([string]::IsNullOrWhiteSpace($script:WebhookUrl) -and (Test-Path -LiteralPath $WebhookPath)) {
-    $script:WebhookUrl = (Get-Content -LiteralPath $WebhookPath -Raw).Trim()
-}
-if ([string]::IsNullOrWhiteSpace($script:WebhookUrl)) {
-    throw "Set the DISCORD_WEBHOOK_URL secret or provide the local .webhook file."
-}
-if ($script:WebhookUrl -notmatch '^https://discord(?:app)?\.com/api/webhooks/') {
-    throw "The configured Discord webhook URL is invalid."
+function Get-TweetId {
+    param([AllowNull()][object]$Post, [AllowNull()][string]$FallbackUrl = "")
+    $guid = if ($null -ne $Post) { [string]$Post.guid } else { "" }
+    if (-not $guid) { $guid = Get-TweetGuidFromUrl -Url $FallbackUrl }
+    if ($guid) { return "tweet:v2:$guid" }
+    if ($FallbackUrl) { return "tweet:v2:$FallbackUrl" }
+    return ""
 }
 
-$forecast = Invoke-RestMethod -Uri $ForecastUrl -Headers @{ Accept = "application/json" }
-$posts = @($forecast.tiboPosts | Sort-Object { [datetime]$_.pubDate })
-$currentIds = @($posts | ForEach-Object { [string]$_.guid })
-$siteSignalTweetUrls = @{}
-$positiveTiboSignalLabels = @(
-    "public reset announcement",
-    "OpenAI team vagueposting",
-    "product-release hint",
-    "imminent GPT-5.6 release",
-    "OpenAI event hint"
-)
-foreach ($historyEntry in @($forecast.history)) {
-    foreach ($change in @($historyEntry.changes)) {
-        if ([int]$change.delta -gt 0 -and [string]$change.label -in $positiveTiboSignalLabels) {
-            foreach ($detail in @($change.details)) {
-                if ([string]$detail.kind -eq "tweet" -and [string]$detail.url) {
-                    $siteSignalTweetUrls[[string]$detail.url] = $true
+function Resolve-TiboPost {
+    param([AllowNull()][string]$Url, [AllowNull()][string]$Guid = "")
+    if ($Guid -and $script:PostByGuid.ContainsKey($Guid)) { return $script:PostByGuid[$Guid] }
+    if ($Url -and $script:PostByUrl.ContainsKey($Url)) { return $script:PostByUrl[$Url] }
+    $urlGuid = Get-TweetGuidFromUrl -Url $Url
+    if ($urlGuid -and $script:PostByGuid.ContainsKey($urlGuid)) { return $script:PostByGuid[$urlGuid] }
+    return $null
+}
+
+function Get-TiboTitle {
+    param(
+        [AllowNull()][object]$Post,
+        [string]$DefaultTitle = "🔎 사이트 로그의 Tibo 근거",
+        [switch]$ClassificationConflict
+    )
+    $category = if ($null -ne $Post) { [string]$Post.tweetAssessment.category } else { "" }
+    $postText = if ($null -ne $Post) { [string]$Post.title } else { "" }
+    if ($ClassificationConflict) { return "⚠️ 사이트가 모순되게 분류한 Tibo 메시지" }
+    if ($postText -match '(?is)\bbanked\s+reset\b|\bapply\s+(?:the|your)\s+reset\b|\breplenish\b.{0,100}\bweekly\s+usage\b|\breset\s+coupon\b') {
+        return "🎟️ Tibo의 리셋 쿠폰 게시"
+    }
+    switch ($category) {
+        "reset_completed" { return "🔄 사이트가 ‘리셋 완료’ 근거로 분류한 Tibo 메시지" }
+        "reset_announced" { return "📣 사이트가 ‘리셋 예정’으로 분류한 Tibo 메시지" }
+        "reset_proposal" { return "⏳ 사이트가 ‘리셋 제안’으로 분류한 Tibo 메시지" }
+        "banked_reset" { return "🎟️ Tibo의 리셋 쿠폰 게시" }
+        "reset_coupon" { return "🎟️ Tibo의 리셋 쿠폰 게시" }
+        default { return $DefaultTitle }
+    }
+}
+
+function Send-TiboNotification {
+    param(
+        [AllowNull()][object]$Post,
+        [string]$FallbackOriginal = "",
+        [string]$FallbackUrl = "",
+        [AllowNull()][object]$FallbackAt = $null,
+        [string]$SourceLabel = "사이트가 근거로 채택한 메시지",
+        [string]$HistoryReason = "",
+        [switch]$ClassificationConflict,
+        [switch]$IsTest
+    )
+
+    $original = if ($null -ne $Post -and [string]$Post.title) { [string]$Post.title } else { $FallbackOriginal }
+    $url = if ($null -ne $Post -and [string]$Post.link) { [string]$Post.link } else { $FallbackUrl }
+    $eventAt = if ($null -ne $Post -and $null -ne $Post.pubDate) { $Post.pubDate } else { $FallbackAt }
+    $translation = Get-KoreanTranslation -Text $original
+    $description = Format-BilingualPost -Original $original -Korean $translation
+    $fields = [System.Collections.Generic.List[object]]::new()
+
+    if ($null -ne $Post -and -not [string]::IsNullOrWhiteSpace([string]$Post.context)) {
+        $fields.Add([ordered]@{
+            name = "답글 대상 문맥"
+            value = Limit-Text -Text ([string]$Post.context) -MaxLength 1024
+            inline = $false
+        })
+    }
+
+    $category = if ($null -ne $Post) { [string]$Post.tweetAssessment.category } else { "site_history_source" }
+    $reason = if ($null -ne $Post) { [string]$Post.tweetAssessment.reason } else { "" }
+    $classification = "분류: ``$category``"
+    if ($null -ne $Post -and $null -ne $Post.tweetAssessment.resetSignalStrength) {
+        $classification += "`n신호 강도: **$([int]$Post.tweetAssessment.resetSignalStrength)** (확률 아님)"
+    }
+    if ($reason) { $classification += "`n$reason" }
+    $fields.Add([ordered]@{
+        name = "사이트 모델 판정"
+        value = Limit-Text -Text $classification -MaxLength 1024
+        inline = $false
+    })
+
+    if ($HistoryReason) {
+        $fields.Add([ordered]@{
+            name = "Recent Movement의 설명"
+            value = Limit-Text -Text $HistoryReason -MaxLength 1024
+            inline = $false
+        })
+    }
+
+    if ($ClassificationConflict) {
+        $fields.Add([ordered]@{
+            name = "⚠️ 사이트 내부 판정 모순"
+            value = "Recent Movement는 이 글을 리셋 근거로 기록했지만, 현재 트윗 판정은 신호 강도 0 또는 ‘무관함’으로 설명합니다. **리셋으로 해석하지 마세요.**"
+            inline = $false
+        })
+    }
+
+    if ($category -eq "reset_completed") {
+        $fields.Add([ordered]@{
+            name = "⚠️ 적용 여부"
+            value = "사이트가 이 게시물을 완료 신호로 분류한 것입니다. **글 내용이나 이 계정의 5시간·주간 한도 적용을 봇이 직접 확인한 것은 아닙니다.**"
+            inline = $false
+        })
+    } elseif ($category -eq "reset_announced") {
+        $fields.Add([ordered]@{
+            name = "상태"
+            value = "리셋 예정 발표입니다. 아직 완료 신호가 아닙니다."
+            inline = $false
+        })
+    }
+
+    $title = Get-TiboTitle -Post $Post -ClassificationConflict:$ClassificationConflict
+    if ($IsTest) { $title = "🧪 형식 확인 · $title" }
+    $footer = "Tibo @thsottiaux · $SourceLabel · 게시 $(Format-KstTime -Value $eventAt) · 사이트 스냅샷 $(Format-KstTime -Value $script:ForecastFetchedAt)"
+    $embed = New-DiscordEmbed `
+        -Title $title `
+        -Description $description `
+        -Url $url `
+        -Color 10181046 `
+        -EventAt $eventAt `
+        -Footer $footer `
+        -Fields @($fields)
+    Send-DiscordEmbeds -Embeds @($embed)
+}
+
+function Format-HistoryDetail {
+    param([object]$Detail)
+    $action = [string]$Detail.action
+    $name = [string]$Detail.name
+    $url = [string]$Detail.url
+    $line = if ($action) { "**$action**: $name" } else { $name }
+    if ($url) { $line += "`n$url" }
+    return $line
+}
+
+function Send-HistoryNotification {
+    param(
+        [object]$Entry,
+        [hashtable]$NotifiedSignals,
+        [switch]$IsRevision,
+        [switch]$IsTest
+    )
+
+    $fromScore = [int]$Entry.fromScore
+    $toScore = [int]$Entry.toScore
+    $scoreDelta = [int]$Entry.scoreDelta
+    $deltaText = if ($scoreDelta -gt 0) { "+$scoreDelta" } else { [string]$scoreDelta }
+    $labels = @($Entry.changes | ForEach-Object { [string]$_.label })
+    $crossed70 = $fromScore -lt 70 -and $toScore -ge 70
+    $confirmedReset = $labels -contains "confirmed reset"
+    $announcedReset = $labels -contains "public reset announcement"
+    $classificationConflict = $false
+    if ($confirmedReset) {
+        foreach ($detail in @($Entry.changes.details | Where-Object { [string]$_.kind -eq "tweet" })) {
+            $conflictPost = Resolve-TiboPost -Url ([string]$detail.url)
+            if ($null -ne $conflictPost) {
+                $conflictStrength = [int]$conflictPost.tweetAssessment.resetSignalStrength
+                $conflictReason = [string]$conflictPost.tweetAssessment.reason
+                if ($conflictStrength -le 0 -or $conflictReason -match '(?i)no .*(?:reset|limits?)|unrelated|무관') {
+                    $classificationConflict = $true
                 }
             }
         }
     }
+
+    if ($classificationConflict) {
+        $title = "⚠️ 사이트 판정 모순 · Recent Movement"
+        $color = 15105570
+    } elseif ($crossed70) {
+        $title = "🚨 70% 돌파 · 사이트 Recent Movement"
+        $color = 16753920
+    } elseif ($confirmedReset) {
+        $title = "📉 사이트 로그 · confirmed reset"
+        $color = 15158332
+    } elseif ($announcedReset) {
+        $title = "📣 사이트 로그 · public reset announcement"
+        $color = 16753920
+    } elseif ($scoreDelta -gt 0) {
+        $title = "📈 사이트 Recent Movement"
+        $color = 5763719
+    } elseif ($scoreDelta -lt 0) {
+        $title = "📉 사이트 Recent Movement"
+        $color = 15105570
+    } else {
+        $title = "➖ 사이트 Recent Movement"
+        $color = 9807270
+    }
+    if ($IsRevision) { $title = "📝 사이트 로그 수정 · $title" }
+    if ($IsTest) { $title = "🧪 형식 확인 · $title" }
+
+    $description = "**${fromScore}% → ${toScore}%** (**${deltaText} pts**)`n이벤트·게시 시각: **$(Format-KstTime -Value $Entry.at)**`n현재 API 스냅샷: **$(Format-KstTime -Value $script:ForecastFetchedAt)**`n봇 감지 시각: **$(Format-KstTime -Value ([DateTimeOffset]::UtcNow))**"
+    if ($IsRevision) {
+        $description += "`n`n📝 같은 이벤트 시각·점수의 사이트 로그 내용이 수정되어 다시 표시합니다."
+    }
+    if ($classificationConflict) {
+        $description += "`n`n⚠️ 사이트 로그는 ``confirmed reset``이라고 쓰지만 현재 트윗 판정은 이를 부정합니다. **리셋 완료로 해석하지 마세요.**"
+    } elseif ($confirmedReset) {
+        $description += "`n`n⚠️ 사이트가 ``confirmed reset``으로 기록한 공개 신호이며 **글 내용이나 이 계정의 실제 한도 적용을 봇이 검증한 것이 아닙니다.**"
+    } elseif ($announcedReset) {
+        $description += "`n`n📣 리셋 예정 발표 신호이며 아직 완료 확인이 아닙니다."
+    }
+
+    $fields = [System.Collections.Generic.List[object]]::new()
+    foreach ($change in @($Entry.changes)) {
+        $changeDelta = [int]$change.delta
+        $changeDeltaText = if ($changeDelta -gt 0) { "+$changeDelta" } else { [string]$changeDelta }
+        $detailLines = [System.Collections.Generic.List[string]]::new()
+        $detailLines.Add("기여도: $([int]$change.from) → $([int]$change.to)")
+        foreach ($detail in @($change.details)) {
+            $detailLines.Add((Format-HistoryDetail -Detail $detail))
+        }
+        if (@($change.details).Count -eq 0) { $detailLines.Add("세부 설명 없음") }
+        $fields.Add([ordered]@{
+            name = Limit-Text -Text ("$changeDeltaText pts · $([string]$change.label)") -MaxLength 256
+            value = Limit-Text -Text ($detailLines -join "`n`n") -MaxLength 1024
+            inline = $false
+        })
+    }
+
+    $footer = "willcodexquotareset.com · 이벤트/게시 · 사이트 스냅샷 · 봇 감지 시각을 본문에 각각 표시"
+    $fieldChunks = [System.Collections.Generic.List[object]]::new()
+    $currentChunk = [System.Collections.Generic.List[object]]::new()
+    $currentSize = 0
+    foreach ($field in @($fields)) {
+        $fieldSize = ([string]$field.name).Length + ([string]$field.value).Length
+        if ($currentChunk.Count -gt 0 -and ($currentChunk.Count -ge 20 -or $currentSize + $fieldSize -gt 4200)) {
+            $fieldChunks.Add([object]$currentChunk.ToArray())
+            $currentChunk = [System.Collections.Generic.List[object]]::new()
+            $currentSize = 0
+        }
+        $currentChunk.Add($field)
+        $currentSize += $fieldSize
+    }
+    if ($currentChunk.Count -gt 0) { $fieldChunks.Add([object]$currentChunk.ToArray()) }
+    if ($fieldChunks.Count -eq 0) { $fieldChunks.Add([object]@()) }
+
+    for ($chunkIndex = 0; $chunkIndex -lt $fieldChunks.Count; $chunkIndex++) {
+        $chunkTitle = $title
+        $chunkDescription = $description
+        if ($fieldChunks.Count -gt 1) {
+            $chunkTitle = "$title ($($chunkIndex + 1)/$($fieldChunks.Count))"
+            if ($chunkIndex -gt 0) { $chunkDescription = "같은 사이트 Recent Movement 기록의 계속입니다." }
+        }
+        $embed = New-DiscordEmbed `
+            -Title $chunkTitle `
+            -Description $chunkDescription `
+            -Url $SiteUrl `
+            -Color $color `
+            -EventAt $Entry.at `
+            -Footer $footer `
+            -Fields ([object[]]$fieldChunks[$chunkIndex])
+        Send-DiscordEmbeds -Embeds @($embed)
+    }
+
+    foreach ($change in @($Entry.changes)) {
+        $historyReason = @($change.details | Where-Object { [string]$_.action -eq "Why it counted" } | ForEach-Object { [string]$_.name }) -join " "
+        foreach ($detail in @($change.details | Where-Object { [string]$_.kind -eq "tweet" })) {
+            $post = Resolve-TiboPost -Url ([string]$detail.url)
+            $signalId = Get-TweetId -Post $post -FallbackUrl ([string]$detail.url)
+            if ($signalId -and -not $NotifiedSignals.ContainsKey($signalId)) {
+                Send-TiboNotification `
+                    -Post $post `
+                    -FallbackOriginal ([string]$detail.name) `
+                    -FallbackUrl ([string]$detail.url) `
+                    -FallbackAt $Entry.at `
+                    -SourceLabel "Recent Movement 근거" `
+                    -HistoryReason $historyReason `
+                    -ClassificationConflict:$classificationConflict `
+                    -IsTest:$IsTest
+                $NotifiedSignals[$signalId] = $true
+                Write-MonitorLog "Sent Tibo source $signalId for history $(Get-HistoryId -Entry $Entry)."
+            }
+        }
+    }
 }
-$resetPosts = @($posts | Where-Object { Test-IsResetRelatedPost -Post $_ -SiteSignalTweetUrls $siteSignalTweetUrls })
+
+function Get-SignalPosts {
+    param([object]$Forecast)
+
+    $selected = @{}
+    foreach ($guid in @($Forecast.forecast.aggregateAssessment.supportingGuids)) {
+        $guidText = [string]$guid
+        if ($script:PostByGuid.ContainsKey($guidText)) { $selected[$guidText] = $script:PostByGuid[$guidText] }
+    }
+    foreach ($post in @($Forecast.tiboPosts)) {
+        $explicitCoupon = [string]$post.title -match '(?is)\bbanked\s+reset\b|\bapply\s+(?:the|your)\s+reset\b|\breplenish\b.{0,100}\bweekly\s+usage\b|\breset\s+coupon\b'
+        if ($explicitCoupon) { $selected[[string]$post.guid] = $post }
+    }
+    foreach ($entry in @($Forecast.history)) {
+        foreach ($change in @($entry.changes)) {
+            foreach ($detail in @($change.details | Where-Object { [string]$_.kind -eq "tweet" })) {
+                $post = Resolve-TiboPost -Url ([string]$detail.url)
+                if ($null -ne $post) { $selected[[string]$post.guid] = $post }
+            }
+        }
+    }
+    return @($selected.Values | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate })
+}
+
+function Save-State {
+    param([object]$State)
+    $parent = Split-Path -Parent $StatePath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+}
+
+function Save-WorkingState {
+    param(
+        [hashtable]$SeenHistory,
+        [hashtable]$HistoryFingerprints,
+        [hashtable]$SeenSignals,
+        [string]$InitializedAt,
+        [int]$Score,
+        [AllowNull()][object]$FetchedAt
+    )
+
+    $keptHistoryIds = @($SeenHistory.Keys | Sort-Object -Descending | Select-Object -First 500)
+    $keptFingerprints = [ordered]@{}
+    foreach ($historyId in $keptHistoryIds) {
+        if ($HistoryFingerprints.ContainsKey($historyId)) {
+            $keptFingerprints[$historyId] = $HistoryFingerprints[$historyId]
+        }
+    }
+    $workingState = [ordered]@{
+        schemaVersion = 2
+        seenHistoryIds = $keptHistoryIds
+        historyFingerprints = $keptFingerprints
+        seenSignalPostIds = @($SeenSignals.Keys | Sort-Object -Descending | Select-Object -First 500)
+        lastScore = $Score
+        initializedAt = $InitializedAt
+        lastCheckedAt = [DateTimeOffset]::UtcNow.ToString("o")
+        siteFetchedAt = Convert-ToIsoUtc -Value $FetchedAt
+    }
+    Save-State -State $workingState
+}
+
+$script:WebhookUrl = [Environment]::GetEnvironmentVariable("DISCORD_WEBHOOK_URL")
+if (-not $DryRun -and [string]::IsNullOrWhiteSpace($script:WebhookUrl) -and (Test-Path -LiteralPath $WebhookPath)) {
+    $script:WebhookUrl = (Get-Content -LiteralPath $WebhookPath -Raw).Trim()
+}
+if (-not $DryRun -and [string]::IsNullOrWhiteSpace($script:WebhookUrl)) {
+    throw "Set the DISCORD_WEBHOOK_URL secret or provide the local .webhook file."
+}
+if (-not $DryRun -and $script:WebhookUrl -notmatch '^https://discord(?:app)?\.com/api/webhooks/') {
+    throw "The configured Discord webhook URL is invalid."
+}
+
+if ($ForecastFile) {
+    $forecast = Get-Content -LiteralPath $ForecastFile -Raw | ConvertFrom-Json
+} else {
+    $forecast = Invoke-RestMethod -Uri $ForecastUrl -Headers @{ Accept = "application/json" }
+}
+$script:ForecastFetchedAt = $forecast.fetchedAt
+
+$script:PostByGuid = @{}
+$script:PostByUrl = @{}
+foreach ($post in @($forecast.tiboPosts)) {
+    if ([string]$post.guid) { $script:PostByGuid[[string]$post.guid] = $post }
+    if ([string]$post.link) { $script:PostByUrl[[string]$post.link] = $post }
+}
+
+$historyEntries = @($forecast.history | Sort-Object { Convert-ToDateTimeOffset -Value $_.at } | Select-Object -Last 500)
+$currentHistoryIds = @($historyEntries | ForEach-Object { Get-HistoryId -Entry $_ })
+$signalPosts = @(Get-SignalPosts -Forecast $forecast | Select-Object -Last 500)
+$currentSignalIds = @($signalPosts | ForEach-Object { Get-TweetId -Post $_ } | Where-Object { $_ })
 
 if ($TestTranslation) {
-    if (-not $resetPosts.Count) { throw "No reset-related Tibo posts are available for the translation test." }
-    $latestPost = $resetPosts[-1]
-    $latestText = [string]$latestPost.title
-    $translation = Get-KoreanTranslation -Text $latestText
-    $testKind = Get-PostKind -Text $latestText
-    $bilingual = Format-BilingualPost -Original $latestText -Korean $translation
-    Send-DiscordEmbed `
-        -Title ("🧪 번역 적용 확인 · {0}" -f $testKind.Title) `
-        -Description $bilingual `
-        -Url ([string]$latestPost.link) `
-        -Color $testKind.Color `
-        -Footer "Tibo @thsottiaux"
+    if (-not $signalPosts.Count) { throw "No site-selected Tibo signal is available for the translation test." }
+    $latestPost = @($signalPosts | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate } -Descending | Select-Object -First 1)[0]
+    Send-TiboNotification -Post $latestPost -SourceLabel "번역 시험" -IsTest
     Write-MonitorLog ("Sent translation test for post {0}." -f [string]$latestPost.guid)
+    exit 0
+}
+
+if ($TestLatestLog) {
+    $testEntry = @(
+        $historyEntries |
+            Where-Object { @($_.changes.details | Where-Object { [string]$_.kind -eq "tweet" }).Count -gt 0 } |
+            Sort-Object { Convert-ToDateTimeOffset -Value $_.at } -Descending |
+            Select-Object -First 1
+    )[0]
+    if ($null -eq $testEntry) {
+        $testEntry = @($historyEntries | Sort-Object { Convert-ToDateTimeOffset -Value $_.at } -Descending | Select-Object -First 1)[0]
+    }
+    if ($null -eq $testEntry) { throw "No Recent Movement entry is available for the format test." }
+    $testSignals = @{}
+    Send-HistoryNotification -Entry $testEntry -NotifiedSignals $testSignals -IsTest
+    Write-MonitorLog ("Sent latest-log format test for {0}." -f (Get-HistoryId -Entry $testEntry))
     exit 0
 }
 
@@ -175,63 +622,83 @@ if (Test-Path -LiteralPath $StatePath) {
     try { $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { $state = $null }
 }
 
-if (-not $state) {
-    $state = [ordered]@{
-        seenPostIds = $currentIds
-        latestResetAt = [string]$forecast.forecast.latestResetAt
-        highForecastAlerted = ([int]$forecast.forecast.score -ge 70)
-        initializedAt = (Get-Date).ToUniversalTime().ToString("o")
+$stateVersion = if ($null -ne $state -and $state.PSObject.Properties.Name -contains "schemaVersion") { [int]$state.schemaVersion } else { 0 }
+if ($stateVersion -lt 2) {
+    $initializedAt = if ($null -ne $state -and $state.PSObject.Properties.Name -contains "initializedAt") {
+        [string]$state.initializedAt
+    } else {
+        [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    $initialFingerprints = [ordered]@{}
+    foreach ($entry in $historyEntries) {
+        $initialFingerprints[(Get-HistoryId -Entry $entry)] = Get-HistoryFingerprint -Entry $entry
+    }
+    $newState = [ordered]@{
+        schemaVersion = 2
+        seenHistoryIds = @($currentHistoryIds | Select-Object -Last 500)
+        historyFingerprints = $initialFingerprints
+        seenSignalPostIds = @($currentSignalIds | Select-Object -Last 500)
+        lastScore = [int]$forecast.forecast.score
+        initializedAt = $initializedAt
+        lastCheckedAt = [DateTimeOffset]::UtcNow.ToString("o")
+        siteFetchedAt = Convert-ToIsoUtc -Value $forecast.fetchedAt
     }
 
-    Send-DiscordEmbed `
-        -Title "✅ Codex 리셋 감지 시작" `
-        -Description ("Tibo의 향후 리셋 예고, 리셋 쿠폰, 실제 할당량 리셋을 감시합니다.`n현재 예측: **{0}%**`n마지막 확인: {1}" -f [int]$forecast.forecast.score, [string]$forecast.fetchedAt) `
-        -Url "https://www.willcodexquotareset.com/" `
-        -Color 5763719
-    Write-MonitorLog "Initialized monitor state and sent startup notification."
-} else {
-    $seen = @{}
-    @($state.seenPostIds) | ForEach-Object { $seen[[string]$_] = $true }
-    $newPosts = @($resetPosts | Where-Object { -not $seen.ContainsKey([string]$_.guid) })
-
-    foreach ($post in $newPosts) {
-        $text = [string]$post.title
-        $kind = Get-PostKind -Text $text
-        $translation = Get-KoreanTranslation -Text $text
-        $bilingual = Format-BilingualPost -Original $text -Korean $translation
-        Send-DiscordEmbed -Title $kind.Title -Description $bilingual -Url ([string]$post.link) -Color $kind.Color -Footer "Tibo @thsottiaux"
-        Write-MonitorLog ("Sent post {0} ({1})." -f [string]$post.guid, $kind.Title)
+    if ($null -eq $state) {
+        $startupDescription = "willcodexquotareset.com의 새 **Recent Movement**, 70% 돌파, 사이트가 근거로 채택한 Tibo 메시지를 감지합니다.`n현재 사이트 예측: **$([int]$forecast.forecast.score)%**`n`n⚠️ 공개 사이트·게시물 감시이며 이 계정의 실제 5시간·주간 한도를 직접 검사하지 않습니다."
+        $startupEmbed = New-DiscordEmbed `
+            -Title "✅ Codex 사이트 로그 감지 시작" `
+            -Description $startupDescription `
+            -Url $SiteUrl `
+            -Color 5763719 `
+            -EventAt $forecast.fetchedAt `
+            -Footer "사이트 확인 $(Format-KstTime -Value $forecast.fetchedAt)"
+        Send-DiscordEmbeds -Embeds @($startupEmbed)
+        Write-MonitorLog "Initialized v2 state and sent truthful startup notification."
+    } else {
+        Write-MonitorLog "Migrated v1 state to v2 without replaying old site history."
     }
 
-    $newResetAt = [string]$forecast.forecast.latestResetAt
-    if ($newResetAt -and $newResetAt -ne [string]$state.latestResetAt) {
-        Send-DiscordEmbed `
-            -Title "🔄 Codex 리셋 상태 확인" `
-            -Description ("공개 상태 데이터에서 새로운 할당량 리셋을 확인했습니다.`n리셋 시각: **{0}**" -f $newResetAt) `
-            -Url "https://www.willcodexquotareset.com/" `
-            -Color 15158332
-        Write-MonitorLog "Sent reset-state notification for $newResetAt."
-    }
-
-    $score = [int]$forecast.forecast.score
-    $wasHigh = [bool]$state.highForecastAlerted
-    if ($score -ge 70 -and -not $wasHigh) {
-        Send-DiscordEmbed `
-            -Title "⚠️ Codex 리셋 가능성 상승" `
-            -Description ("향후 48시간 리셋 예측이 **{0}%**까지 상승했습니다." -f $score) `
-            -Url "https://www.willcodexquotareset.com/" `
-            -Color 16753920
-        Write-MonitorLog "Sent high-forecast notification at $score percent."
-    }
-
-    $state = [ordered]@{
-        seenPostIds = @($currentIds | Select-Object -First 200)
-        latestResetAt = $newResetAt
-        highForecastAlerted = ($score -ge 70)
-        initializedAt = [string]$state.initializedAt
-        lastCheckedAt = (Get-Date).ToUniversalTime().ToString("o")
-    }
+    Save-State -State $newState
+    exit 0
 }
 
-$state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
-Write-MonitorLog "Check completed."
+$seenHistory = @{}
+@($state.seenHistoryIds) | ForEach-Object { $seenHistory[[string]$_] = $true }
+$historyFingerprints = @{}
+if ($state.PSObject.Properties.Name -contains "historyFingerprints" -and $null -ne $state.historyFingerprints) {
+    foreach ($property in @($state.historyFingerprints.PSObject.Properties)) {
+        $historyFingerprints[[string]$property.Name] = [string]$property.Value
+    }
+}
+$seenSignals = @{}
+@($state.seenSignalPostIds) | ForEach-Object { $seenSignals[[string]$_] = $true }
+
+foreach ($entry in $historyEntries) {
+    $historyId = Get-HistoryId -Entry $entry
+    $fingerprint = Get-HistoryFingerprint -Entry $entry
+    $isRevision = $seenHistory.ContainsKey($historyId) -and $historyFingerprints.ContainsKey($historyId) -and $historyFingerprints[$historyId] -ne $fingerprint
+    if ($seenHistory.ContainsKey($historyId) -and -not $isRevision) {
+        if (-not $historyFingerprints.ContainsKey($historyId)) { $historyFingerprints[$historyId] = $fingerprint }
+        continue
+    }
+
+    Send-HistoryNotification -Entry $entry -NotifiedSignals $seenSignals -IsRevision:$isRevision
+    $seenHistory[$historyId] = $true
+    $historyFingerprints[$historyId] = $fingerprint
+    Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    Write-MonitorLog "Sent site history $historyId (revision=$isRevision)."
+}
+
+foreach ($post in $signalPosts) {
+    $signalId = Get-TweetId -Post $post
+    if (-not $signalId -or $seenSignals.ContainsKey($signalId)) { continue }
+
+    Send-TiboNotification -Post $post -SourceLabel "현재 forecast 근거"
+    $seenSignals[$signalId] = $true
+    Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    Write-MonitorLog "Sent site-selected Tibo signal $signalId."
+}
+
+Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+Write-MonitorLog "Check completed with no latestResetAt comparison."

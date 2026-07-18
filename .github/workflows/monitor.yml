@@ -2,9 +2,15 @@ name: Codex quota reset monitor
 
 on:
   schedule:
-    # The source site refreshes around :09 and :39 each hour.
-    - cron: "12,42 * * * *"
+    # Off-peak minutes reduce (but cannot eliminate) GitHub schedule delays.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+    inputs:
+      test_latest_log:
+        description: Send one clearly labelled Recent Movement + Tibo format test
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,14 +36,23 @@ jobs:
           restore-keys: |
             codex-reset-state-
 
+      - name: Test monitor logic
+        shell: pwsh
+        run: ./tests/run.ps1
+
       - name: Check reset signals
         shell: pwsh
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: ./monitor.ps1
+        run: |
+          if ('${{ github.event.inputs.test_latest_log }}' -eq 'true') {
+            ./monitor.ps1 -TestLatestLog
+          } else {
+            ./monitor.ps1
+          }
 
       - name: Save notification state
-        if: ${{ always() && hashFiles('state.json') != '' }}
+        if: ${{ always() && github.event.inputs.test_latest_log != 'true' && hashFiles('state.json') != '' }}
         uses: actions/cache/save@v4
         with:
           path: state.json
