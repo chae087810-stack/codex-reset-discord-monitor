@@ -17,7 +17,8 @@ function Save-Fixture {
 }
 
 function Invoke-DryRun {
-    $output = & $Monitor -DryRun -ForecastFile $Fixture -StateFile $State *>&1 | Out-String
+    param([switch]$TestLatestLog)
+    $output = & $Monitor -DryRun -ForecastFile $Fixture -StateFile $State -TestLatestLog:$TestLatestLog *>&1 | Out-String
     if (-not $?) { throw "Monitor dry run failed: $output" }
     return $output
 }
@@ -33,217 +34,134 @@ function Get-Payloads {
     return @($payloads)
 }
 
+function New-TiboPost {
+    param(
+        [string]$Guid,
+        [string]$Category,
+        [string]$Title,
+        [int]$Strength = 70,
+        [string]$Reason = "Reset-related post."
+    )
+    return [ordered]@{
+        guid = $Guid
+        link = "https://x.com/thsottiaux/status/$Guid"
+        pubDate = "2026-07-19T00:$Guid`:00.000Z"
+        title = $Title
+        context = ""
+        tweetAssessment = [ordered]@{
+            category = $Category
+            reason = $Reason
+            resetSignalStrength = $Strength
+        }
+    }
+}
+
 try {
     New-Item -ItemType Directory -Path $TempRoot -Force | Out-Null
 
-    $baseHistory = [ordered]@{
-        at = "2026-07-18T23:45:00.000Z"
-        fromScore = 60
-        scoreDelta = 0
-        toScore = 60
-        changes = @([ordered]@{ label = "baseline"; from = 12; delta = 0; to = 12 })
-    }
+    $proposal = New-TiboPost -Guid "01" -Category "reset_proposal" -Title "Should we reset tomorrow?"
+    $announcement = New-TiboPost -Guid "02" -Category "reset_announced" -Title "A reset may happen later."
+    $coupon = New-TiboPost -Guid "03" -Category "reset_coupon" -Title "You have a banked reset coupon."
     $base = [ordered]@{
-        fetchedAt = "2026-07-18T23:50:00.000Z"
+        fetchedAt = "2026-07-19T00:05:00.000Z"
         forecast = [ordered]@{
-            score = 60
+            score = 95
             latestResetAt = $null
-            aggregateAssessment = [ordered]@{ supportingGuids = @() }
+            aggregateAssessment = [ordered]@{ supportingGuids = @("01", "02", "03") }
         }
-        history = @($baseHistory)
-        tiboPosts = @()
-    }
-    Save-Fixture -Value $base
-    $null = Invoke-DryRun
-
-    $proposalPost = [ordered]@{
-        guid = "1001"
-        link = "https://x.com/thsottiaux/status/1001"
-        pubDate = "2026-07-19T00:00:00.000Z"
-        title = "Confirmed"
-        context = "How about today's reset?"
-        tweetAssessment = [ordered]@{
-            category = "reset_proposal"
-            reason = "Explicit reset proposal."
-            resetSignalStrength = 70
-        }
-    }
-    $crossing = [ordered]@{
-        at = "2026-07-19T00:00:00.000Z"
-        fromScore = 60
-        scoreDelta = 15
-        toScore = 75
-        changes = @([ordered]@{
-            label = "LLM tweet-context judgment"
-            from = 0
-            delta = 15
-            to = 15
+        history = @([ordered]@{
+            at = "2026-07-19T00:04:00.000Z"
+            fromScore = 20
+            scoreDelta = 75
+            toScore = 95
+            changes = @([ordered]@{ label = "strong reset forecast"; from = 0; delta = 75; to = 75 })
         })
+        tiboPosts = @($proposal, $announcement, $coupon)
     }
-    $base.fetchedAt = "2026-07-19T00:01:00.000Z"
-    $base.forecast.score = 75
-    $base.forecast.aggregateAssessment.supportingGuids = @("1001")
-    $base.history = @($crossing, $baseHistory)
-    $base.tiboPosts = @($proposalPost)
+
     Save-Fixture -Value $base
+    $initialOutput = Invoke-DryRun
+    Assert-True (@(Get-Payloads -Output $initialOutput).Count -eq 0) "Initialization produced an unwanted Discord alert."
+    $initialState = Get-Content -LiteralPath $State -Raw | ConvertFrom-Json
+    Assert-True ([int]$initialState.schemaVersion -eq 3) "The monitor did not initialize schema v3."
 
-    $crossingOutput = Invoke-DryRun
-    $crossingPayloads = @(Get-Payloads -Output $crossingOutput)
-    Assert-True ($crossingPayloads.Count -eq 2) "Expected one history payload and one Tibo payload for the 70 percent crossing."
-    Assert-True ([string]$crossingPayloads[0].embeds[0].title -match "70%") "The history title did not identify the 70 percent crossing."
-    Assert-True ([string]$crossingPayloads[0].embeds[0].description -match "2026-07-19 09:00:00 KST") "The site event was not rendered in KST."
-    Assert-True ([string]$crossingPayloads[1].embeds[0].url -eq $proposalPost.link) "The site-selected Tibo link was not preserved."
-    Assert-True ([string]$crossingPayloads[1].embeds[0].description -match "Confirmed") "The Tibo original was not included."
-
-    $duplicateOutput = Invoke-DryRun
-    Assert-True (@(Get-Payloads -Output $duplicateOutput).Count -eq 0) "An unchanged API response produced duplicate alerts."
-
-    $base.forecast.latestResetAt = "2026-07-19T00:05:00.000Z"
+    $base.fetchedAt = "2026-07-19T00:06:00.000Z"
+    $base.forecast.score = 100
+    $base.history = @([ordered]@{
+        at = "2026-07-19T00:06:00.000Z"
+        fromScore = 95
+        scoreDelta = 5
+        toScore = 100
+        changes = @([ordered]@{ label = "confirmed soon"; from = 0; delta = 5; to = 5 })
+    }) + @($base.history)
     Save-Fixture -Value $base
-    $latestResetOnlyOutput = Invoke-DryRun
-    Assert-True (@(Get-Payloads -Output $latestResetOnlyOutput).Count -eq 0) "A latestResetAt-only change produced an alert."
+    $noiseOutput = Invoke-DryRun
+    Assert-True (@(Get-Payloads -Output $noiseOutput).Count -eq 0) "Forecast, history, proposal, announcement, or coupon noise produced an alert."
 
-    $completedPost = [ordered]@{
-        guid = "1002"
-        link = "https://x.com/thsottiaux/status/1002"
-        pubDate = "2026-07-19T00:10:00.000Z"
-        title = "Enjoy reset usage limits."
-        context = ""
-        tweetAssessment = [ordered]@{
-            category = "reset_completed"
-            reason = "Explicit completed reset post."
-            resetSignalStrength = 85
-        }
-    }
-    $completed = [ordered]@{
+    $completed = New-TiboPost -Guid "10" -Category "reset_completed" -Title "Enjoy reset usage limits." -Strength 90 -Reason "Explicit completed Codex usage reset."
+    $base.fetchedAt = "2026-07-19T00:11:00.000Z"
+    $base.forecast.score = 3
+    $base.forecast.latestResetAt = "2026-07-19T00:10:00.000Z"
+    $base.tiboPosts = @($proposal, $announcement, $coupon, $completed)
+    $base.history = @([ordered]@{
         at = "2026-07-19T00:10:00.000Z"
-        fromScore = 75
-        scoreDelta = -72
+        fromScore = 100
+        scoreDelta = -97
         toScore = 3
         changes = @([ordered]@{
             label = "confirmed reset"
-            from = 75
-            delta = -72
+            from = 100
+            delta = -97
             to = 3
-            details = @(
-                [ordered]@{ kind = "tweet"; action = "Source post"; name = $completedPost.title; url = $completedPost.link },
-                [ordered]@{ action = "Why it counted"; name = "Explicit completed reset post." }
-            )
+            details = @([ordered]@{ kind = "tweet"; name = $completed.title; url = $completed.link })
         })
-    }
-    $base.fetchedAt = "2026-07-19T00:11:00.000Z"
-    $base.forecast.score = 3
-    $base.forecast.latestResetAt = $completed.at
-    $base.history = @($completed, $crossing, $baseHistory)
-    $base.tiboPosts = @($proposalPost, $completedPost)
+    }) + @($base.history)
     Save-Fixture -Value $base
 
     $completedOutput = Invoke-DryRun
     $completedPayloads = @(Get-Payloads -Output $completedOutput)
-    Assert-True ($completedPayloads.Count -eq 2) "Expected one completed-reset history payload and one source-post payload."
-    $actualCompletedTimestamp = ([DateTime]$completedPayloads[0].embeds[0].timestamp).ToUniversalTime()
-    $expectedCompletedTimestamp = ([DateTime]"2026-07-19T00:10:00.000Z").ToUniversalTime()
-    Assert-True ($actualCompletedTimestamp -eq $expectedCompletedTimestamp) "The embed timestamp did not use the site event time."
-    Assert-True ([string]$completedPayloads[1].embeds[0].fields[0].value -match "reset_completed") "The completed category was not shown."
-    Assert-True ([string]$completedPayloads[1].embeds[0].description -match "Enjoy reset usage limits") "The completed Tibo original was not shown."
+    Assert-True ($completedPayloads.Count -eq 1) "A completed reset did not produce exactly one Tibo alert."
+    $completedEmbed = $completedPayloads[0].embeds[0]
+    Assert-True ([string]$completedEmbed.title -match "Tibo.*Codex") "The alert title did not identify Tibo's Codex reset."
+    Assert-True ([string]$completedEmbed.url -eq $completed.link) "The completed Tibo post link was not preserved."
+    Assert-True ([string]$completedEmbed.description -match "Enjoy reset usage limits") "The completed Tibo original was not included."
+    Assert-True ((@($completedEmbed.fields | ForEach-Object { [string]$_.value }) -join " ") -match "reset_completed") "The completed category was not included."
 
-    $completed.changes[0].details[1].name = "Corrected site explanation."
+    $duplicateOutput = Invoke-DryRun
+    Assert-True (@(Get-Payloads -Output $duplicateOutput).Count -eq 0) "An unchanged completed post produced a duplicate alert."
+
+    $base.history[0].changes[0].details += [ordered]@{ name = "History revision only" }
     $base.fetchedAt = "2026-07-19T00:12:00.000Z"
     Save-Fixture -Value $base
     $revisionOutput = Invoke-DryRun
-    $revisionPayloads = @(Get-Payloads -Output $revisionOutput)
-    Assert-True ($revisionPayloads.Count -eq 1) "A revised history entry did not produce exactly one revision alert."
-    Assert-True ([string]$revisionPayloads[0].embeds[0].fields[0].value -match "Corrected site explanation") "The revised site detail was not shown."
+    Assert-True (@(Get-Payloads -Output $revisionOutput).Count -eq 0) "A Recent Movement revision produced an alert."
 
-    $longChanges = @()
-    for ($index = 1; $index -le 8; $index++) {
-        $longChanges += [ordered]@{
-            label = "long change $index"
-            from = 0
-            delta = 1
-            to = 1
-            details = @([ordered]@{ action = "Detail"; name = ("x" * 900) })
-        }
-    }
-    $longEntry = [ordered]@{
-        at = "2026-07-19T00:20:00.000Z"
-        fromScore = 3
-        scoreDelta = 8
-        toScore = 11
-        changes = $longChanges
-    }
+    $conflict = New-TiboPost -Guid "20" -Category "reset_completed" -Title "The sun came out." -Strength 0 -Reason "No Codex reset mention; unrelated."
     $base.fetchedAt = "2026-07-19T00:21:00.000Z"
-    $base.forecast.score = 11
-    $base.history = @($longEntry, $completed, $crossing, $baseHistory)
-    Save-Fixture -Value $base
-    $longOutput = Invoke-DryRun
-    $longPayloads = @(Get-Payloads -Output $longOutput)
-    Assert-True ($longPayloads.Count -gt 1) "A long history entry was not split across payloads."
-    $longFieldCount = 0
-    foreach ($payload in $longPayloads) {
-        $embed = $payload.embeds[0]
-        $textLength = ([string]$embed.title).Length + ([string]$embed.description).Length + ([string]$embed.footer.text).Length
-        foreach ($field in @($embed.fields)) {
-            $textLength += ([string]$field.name).Length + ([string]$field.value).Length
-            $longFieldCount++
-        }
-        Assert-True ($textLength -le 6000) "A split embed exceeded Discord's 6000-character limit."
-    }
-    Assert-True ($longFieldCount -eq 8) "A long history entry dropped one or more change fields."
-
-    $conflictPost = [ordered]@{
-        guid = "1003"
-        link = "https://x.com/thsottiaux/status/1003"
-        pubDate = "2026-07-19T00:30:00.000Z"
-        title = "The sun came out " + ("y" * 4000)
-        context = "Unrelated conversation " + ("c" * 4000)
-        tweetAssessment = [ordered]@{
-            category = "reset_completed"
-            reason = "No Codex reset mention; unrelated. " + ("r" * 4000)
-            resetSignalStrength = 0
-        }
-    }
-    $conflictEntry = [ordered]@{
-        at = "2026-07-19T00:30:00.000Z"
-        fromScore = 95
-        scoreDelta = -53
-        toScore = 42
-        changes = @([ordered]@{
-            label = "confirmed reset"
-            from = 95
-            delta = -53
-            to = 42
-            details = @(
-                [ordered]@{ kind = "tweet"; action = "Source post"; name = $conflictPost.title; url = $conflictPost.link },
-                [ordered]@{ action = "Why it counted"; name = "Explicit completed Codex quota-reset post. " + ("h" * 4000) }
-            )
-        })
-    }
-    $base.fetchedAt = "2026-07-19T00:31:00.000Z"
-    $base.forecast.score = 42
-    $base.history = @($conflictEntry, $longEntry, $completed, $crossing, $baseHistory)
-    $base.tiboPosts = @($proposalPost, $completedPost, $conflictPost)
+    $base.tiboPosts += $conflict
     Save-Fixture -Value $base
     $conflictOutput = Invoke-DryRun
-    $conflictPayloads = @(Get-Payloads -Output $conflictOutput)
-    Assert-True ($conflictPayloads.Count -eq 2) "The contradictory site classification did not produce history and source payloads."
-    Assert-True ([int]$conflictPayloads[0].embeds[0].color -eq 15105570) "The contradictory site classification was not rendered as a warning."
-    Assert-True ([string]$conflictPayloads[1].embeds[0].description -match "The sun came out") "The contradictory Tibo original was hidden."
-    Assert-True ((@($conflictPayloads[1].embeds[0].fields | ForEach-Object { [string]$_.value }) -join " ") -match "No Codex reset mention; unrelated") "The current contradictory model reason was hidden."
-    Assert-True (@($conflictPayloads[1].embeds[0].fields).Count -ge 2) "Long Tibo content removed a safety field."
-    Assert-True ([string]$conflictPayloads[1].embeds[0].fields[0].value -match "Recent Movement") "The contradiction warning was not prioritized under Discord's length limit."
+    Assert-True (@(Get-Payloads -Output $conflictOutput).Count -eq 0) "A contradictory reset-completed classification produced an alert."
+    $conflictDuplicateOutput = Invoke-DryRun
+    Assert-True (@(Get-Payloads -Output $conflictDuplicateOutput).Count -eq 0) "A suppressed contradictory post was reconsidered on every run."
+
+    $testOutput = Invoke-DryRun -TestLatestLog
+    $testPayloads = @(Get-Payloads -Output $testOutput)
+    Assert-True ($testPayloads.Count -eq 1) "The manual format test did not send exactly one completed-reset example."
+    Assert-True ([string]$testPayloads[0].embeds[0].title -match "Tibo.*Codex") "The manual test did not use the completed-reset alert format."
 
     Remove-Item -LiteralPath $State -Force
     [ordered]@{
-        seenPostIds = @("legacy")
-        latestResetAt = "2026-07-01T00:00:00.000Z"
-        highForecastAlerted = $true
+        schemaVersion = 2
+        seenHistoryIds = @("legacy")
+        seenSignalPostIds = @()
         initializedAt = "2026-07-01T00:00:00.000Z"
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $State -Encoding UTF8
     $migrationOutput = Invoke-DryRun
-    Assert-True (@(Get-Payloads -Output $migrationOutput).Count -eq 0) "The v1 migration replayed old alerts."
+    Assert-True (@(Get-Payloads -Output $migrationOutput).Count -eq 0) "The v2-to-v3 migration replayed old completed posts."
     $migrated = Get-Content -LiteralPath $State -Raw | ConvertFrom-Json
-    Assert-True ([int]$migrated.schemaVersion -eq 2) "The state did not migrate to schema v2."
+    Assert-True ([int]$migrated.schemaVersion -eq 3) "The state did not migrate to schema v3."
+    Assert-True (@($migrated.seenCompletedResetPostIds).Count -eq 2) "Migration did not baseline all current completed-post IDs."
 
     Write-Output "All monitor tests passed."
 } finally {
