@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       test_latest_log:
-        description: Send one clearly labelled Recent Movement + Tibo format test
+        description: Send one clearly labelled Tibo reset-completed format test
         required: false
         default: false
         type: boolean

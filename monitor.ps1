@@ -246,19 +246,10 @@ function Resolve-TiboPost {
 function Test-IsPostClassificationConflict {
     param([AllowNull()][object]$Post, [AllowNull()][object[]]$HistoryEntries = @())
     if ($null -eq $Post) { return $false }
+    if ([string]$Post.tweetAssessment.category -ne "reset_completed") { return $false }
     $strength = [int]$Post.tweetAssessment.resetSignalStrength
     $reason = [string]$Post.tweetAssessment.reason
-    if ($strength -gt 0 -and $reason -notmatch '(?i)no .*(?:reset|limits?)|unrelated|무관') { return $false }
-
-    $postGuid = [string]$Post.guid
-    foreach ($entry in @($HistoryEntries)) {
-        foreach ($change in @($entry.changes | Where-Object { [string]$_.label -eq "confirmed reset" })) {
-            foreach ($detail in @($change.details | Where-Object { [string]$_.kind -eq "tweet" })) {
-                if ((Get-TweetGuidFromUrl -Url ([string]$detail.url)) -eq $postGuid) { return $true }
-            }
-        }
-    }
-    return $false
+    return ($strength -le 0 -or $reason -match '(?i)\bno\b.{0,80}\b(?:reset|limits?)\b.{0,40}\b(?:mention|signal|relevance)|\bunrelated\b|\bnot\b.{0,40}\b(?:reset|limits?)\b|무관|리셋.{0,20}아님')
 }
 
 function Get-TiboTitle {
@@ -270,11 +261,11 @@ function Get-TiboTitle {
     $category = if ($null -ne $Post) { [string]$Post.tweetAssessment.category } else { "" }
     $postText = if ($null -ne $Post) { [string]$Post.title } else { "" }
     if ($ClassificationConflict) { return "⚠️ 사이트가 모순되게 분류한 Tibo 메시지" }
+    if ($category -eq "reset_completed") { return "🔄 Tibo의 Codex 사용량 리셋 완료 게시" }
     if ($postText -match '(?is)\bbanked\s+reset\b|\bapply\s+(?:the|your)\s+reset\b|\breplenish\b.{0,100}\bweekly\s+usage\b|\breset\s+coupon\b') {
         return "🎟️ Tibo의 리셋 쿠폰 게시"
     }
     switch ($category) {
-        "reset_completed" { return "🔄 사이트가 ‘리셋 완료’ 근거로 분류한 Tibo 메시지" }
         "reset_announced" { return "📣 사이트가 ‘리셋 예정’으로 분류한 Tibo 메시지" }
         "reset_proposal" { return "⏳ 사이트가 ‘리셋 제안’으로 분류한 Tibo 메시지" }
         "banked_reset" { return "🎟️ Tibo의 리셋 쿠폰 게시" }
@@ -524,24 +515,14 @@ function Send-HistoryNotification {
     }
 }
 
-function Get-SignalPosts {
+function Get-CompletedResetPosts {
     param([object]$Forecast)
 
     $selected = @{}
-    foreach ($guid in @($Forecast.forecast.aggregateAssessment.supportingGuids)) {
-        $guidText = [string]$guid
-        if ($script:PostByGuid.ContainsKey($guidText)) { $selected[$guidText] = $script:PostByGuid[$guidText] }
-    }
     foreach ($post in @($Forecast.tiboPosts)) {
-        $explicitCoupon = [string]$post.title -match '(?is)\bbanked\s+reset\b|\bapply\s+(?:the|your)\s+reset\b|\breplenish\b.{0,100}\bweekly\s+usage\b|\breset\s+coupon\b'
-        if ($explicitCoupon) { $selected[[string]$post.guid] = $post }
-    }
-    foreach ($entry in @($Forecast.history)) {
-        foreach ($change in @($entry.changes)) {
-            foreach ($detail in @($change.details | Where-Object { [string]$_.kind -eq "tweet" })) {
-                $post = Resolve-TiboPost -Url ([string]$detail.url)
-                if ($null -ne $post) { $selected[[string]$post.guid] = $post }
-            }
+        if ([string]$post.tweetAssessment.category -eq "reset_completed") {
+            $postId = Get-TweetId -Post $post
+            if ($postId) { $selected[$postId] = $post }
         }
     }
     return @($selected.Values | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate })
@@ -558,26 +539,15 @@ function Save-State {
 
 function Save-WorkingState {
     param(
-        [hashtable]$SeenHistory,
-        [hashtable]$HistoryFingerprints,
-        [hashtable]$SeenSignals,
+        [hashtable]$SeenCompletedPosts,
         [string]$InitializedAt,
         [int]$Score,
         [AllowNull()][object]$FetchedAt
     )
 
-    $keptHistoryIds = @($SeenHistory.Keys | Sort-Object -Descending | Select-Object -First 500)
-    $keptFingerprints = [ordered]@{}
-    foreach ($historyId in $keptHistoryIds) {
-        if ($HistoryFingerprints.ContainsKey($historyId)) {
-            $keptFingerprints[$historyId] = $HistoryFingerprints[$historyId]
-        }
-    }
     $workingState = [ordered]@{
-        schemaVersion = 2
-        seenHistoryIds = $keptHistoryIds
-        historyFingerprints = $keptFingerprints
-        seenSignalPostIds = @($SeenSignals.Keys | Sort-Object -Descending | Select-Object -First 500)
+        schemaVersion = 3
+        seenCompletedResetPostIds = @($SeenCompletedPosts.Keys | Sort-Object -Descending | Select-Object -First 500)
         lastScore = $Score
         initializedAt = $InitializedAt
         lastCheckedAt = [DateTimeOffset]::UtcNow.ToString("o")
@@ -612,32 +582,22 @@ foreach ($post in @($forecast.tiboPosts)) {
 }
 
 $historyEntries = @($forecast.history | Sort-Object { Convert-ToDateTimeOffset -Value $_.at } | Select-Object -Last 500)
-$currentHistoryIds = @($historyEntries | ForEach-Object { Get-HistoryId -Entry $_ })
-$signalPosts = @(Get-SignalPosts -Forecast $forecast | Select-Object -Last 500)
-$currentSignalIds = @($signalPosts | ForEach-Object { Get-TweetId -Post $_ } | Where-Object { $_ })
+$completedResetPosts = @(Get-CompletedResetPosts -Forecast $forecast | Select-Object -Last 500)
+$currentCompletedResetIds = @($completedResetPosts | ForEach-Object { Get-TweetId -Post $_ } | Where-Object { $_ })
 
 if ($TestTranslation) {
-    if (-not $signalPosts.Count) { throw "No site-selected Tibo signal is available for the translation test." }
-    $latestPost = @($signalPosts | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate } -Descending | Select-Object -First 1)[0]
-    Send-TiboNotification -Post $latestPost -SourceLabel "번역 시험" -IsTest
+    $latestPost = @($completedResetPosts | Where-Object { -not (Test-IsPostClassificationConflict -Post $_) } | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate } -Descending | Select-Object -First 1)[0]
+    if ($null -eq $latestPost) { throw "No valid Tibo reset-completed post is available for the translation test." }
+    Send-TiboNotification -Post $latestPost -SourceLabel "리셋 완료 번역 시험" -IsTest
     Write-MonitorLog ("Sent translation test for post {0}." -f [string]$latestPost.guid)
     exit 0
 }
 
 if ($TestLatestLog) {
-    $testEntry = @(
-        $historyEntries |
-            Where-Object { @($_.changes.details | Where-Object { [string]$_.kind -eq "tweet" }).Count -gt 0 } |
-            Sort-Object { Convert-ToDateTimeOffset -Value $_.at } -Descending |
-            Select-Object -First 1
-    )[0]
-    if ($null -eq $testEntry) {
-        $testEntry = @($historyEntries | Sort-Object { Convert-ToDateTimeOffset -Value $_.at } -Descending | Select-Object -First 1)[0]
-    }
-    if ($null -eq $testEntry) { throw "No Recent Movement entry is available for the format test." }
-    $testSignals = @{}
-    Send-HistoryNotification -Entry $testEntry -NotifiedSignals $testSignals -IsTest
-    Write-MonitorLog ("Sent latest-log format test for {0}." -f (Get-HistoryId -Entry $testEntry))
+    $latestPost = @($completedResetPosts | Where-Object { -not (Test-IsPostClassificationConflict -Post $_) } | Sort-Object { Convert-ToDateTimeOffset -Value $_.pubDate } -Descending | Select-Object -First 1)[0]
+    if ($null -eq $latestPost) { throw "No valid Tibo reset-completed post is available for the format test." }
+    Send-TiboNotification -Post $latestPost -SourceLabel "리셋 완료 알림 시험" -IsTest
+    Write-MonitorLog ("Sent reset-completed format test for {0}." -f (Get-TweetId -Post $latestPost))
     exit 0
 }
 
@@ -647,90 +607,46 @@ if (Test-Path -LiteralPath $StatePath) {
 }
 
 $stateVersion = if ($null -ne $state -and $state.PSObject.Properties.Name -contains "schemaVersion") { [int]$state.schemaVersion } else { 0 }
-if ($stateVersion -lt 2) {
+if ($stateVersion -lt 3) {
     $initializedAt = if ($null -ne $state -and $state.PSObject.Properties.Name -contains "initializedAt") {
         [string]$state.initializedAt
     } else {
         [DateTimeOffset]::UtcNow.ToString("o")
     }
-    $initialFingerprints = [ordered]@{}
-    foreach ($entry in $historyEntries) {
-        $initialFingerprints[(Get-HistoryId -Entry $entry)] = Get-HistoryFingerprint -Entry $entry
-    }
     $newState = [ordered]@{
-        schemaVersion = 2
-        seenHistoryIds = @($currentHistoryIds | Select-Object -Last 500)
-        historyFingerprints = $initialFingerprints
-        seenSignalPostIds = @($currentSignalIds | Select-Object -Last 500)
+        schemaVersion = 3
+        seenCompletedResetPostIds = @($currentCompletedResetIds | Select-Object -Last 500)
         lastScore = [int]$forecast.forecast.score
         initializedAt = $initializedAt
         lastCheckedAt = [DateTimeOffset]::UtcNow.ToString("o")
         siteFetchedAt = Convert-ToIsoUtc -Value $forecast.fetchedAt
     }
 
-    if ($null -eq $state) {
-        $startupDescription = "willcodexquotareset.com의 새 **Recent Movement**, 70% 돌파, 사이트가 근거로 채택한 Tibo 메시지를 감지합니다.`n현재 사이트 예측: **$([int]$forecast.forecast.score)%**`n`n⚠️ 공개 사이트·게시물 감시이며 이 계정의 실제 5시간·주간 한도를 직접 검사하지 않습니다."
-        $startupEmbed = New-DiscordEmbed `
-            -Title "✅ Codex 사이트 로그 감지 시작" `
-            -Description $startupDescription `
-            -Url $SiteUrl `
-            -Color 5763719 `
-            -EventAt $forecast.fetchedAt `
-            -Footer "사이트 확인 $(Format-KstTime -Value $forecast.fetchedAt)"
-        Send-DiscordEmbeds -Embeds @($startupEmbed)
-        Write-MonitorLog "Initialized v2 state and sent truthful startup notification."
-    } else {
-        Write-MonitorLog "Migrated v1 state to v2 without replaying old site history."
-    }
+    Write-MonitorLog "Initialized v3 reset-completed-only state without replaying old posts."
 
     Save-State -State $newState
     exit 0
 }
 
-$seenHistory = @{}
-@($state.seenHistoryIds) | ForEach-Object { $seenHistory[[string]$_] = $true }
-$historyFingerprints = @{}
-if ($state.PSObject.Properties.Name -contains "historyFingerprints" -and $null -ne $state.historyFingerprints) {
-    foreach ($property in @($state.historyFingerprints.PSObject.Properties)) {
-        $historyFingerprints[[string]$property.Name] = [string]$property.Value
-    }
-}
-$seenSignals = @{}
-@($state.seenSignalPostIds) | ForEach-Object { $seenSignals[[string]$_] = $true }
+$seenCompletedPosts = @{}
+@($state.seenCompletedResetPostIds) | ForEach-Object { $seenCompletedPosts[[string]$_] = $true }
 
-foreach ($entry in $historyEntries) {
-    $historyId = Get-HistoryId -Entry $entry
-    $fingerprint = Get-HistoryFingerprint -Entry $entry
-    $isRevision = $seenHistory.ContainsKey($historyId) -and $historyFingerprints.ContainsKey($historyId) -and $historyFingerprints[$historyId] -ne $fingerprint
-    if ($seenHistory.ContainsKey($historyId) -and -not $isRevision) {
-        if (-not $historyFingerprints.ContainsKey($historyId)) { $historyFingerprints[$historyId] = $fingerprint }
+foreach ($post in $completedResetPosts) {
+    $postId = Get-TweetId -Post $post
+    if (-not $postId -or $seenCompletedPosts.ContainsKey($postId)) { continue }
+
+    if (Test-IsPostClassificationConflict -Post $post) {
+        $seenCompletedPosts[$postId] = $true
+        Save-WorkingState -SeenCompletedPosts $seenCompletedPosts -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+        Write-MonitorLog "Suppressed contradictory reset-completed classification $postId."
         continue
     }
 
-    $afterHistorySent = {
-        $seenHistory[$historyId] = $true
-        $historyFingerprints[$historyId] = $fingerprint
-        Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
-    }
-    $afterSignalSent = {
-        param([string]$DeliveredSignalId)
-        $seenSignals[$DeliveredSignalId] = $true
-        Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
-    }
-    Send-HistoryNotification -Entry $entry -NotifiedSignals $seenSignals -IsRevision:$isRevision -AfterHistorySent $afterHistorySent -AfterSignalSent $afterSignalSent
-    Write-MonitorLog "Sent site history $historyId (revision=$isRevision)."
+    Send-TiboNotification -Post $post -SourceLabel "Tibo 리셋 완료 게시"
+    $seenCompletedPosts[$postId] = $true
+    Save-WorkingState -SeenCompletedPosts $seenCompletedPosts -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+    Write-MonitorLog "Sent Tibo reset-completed post $postId."
 }
 
-foreach ($post in $signalPosts) {
-    $signalId = Get-TweetId -Post $post
-    if (-not $signalId -or $seenSignals.ContainsKey($signalId)) { continue }
-
-    $signalConflict = Test-IsPostClassificationConflict -Post $post -HistoryEntries $historyEntries
-    Send-TiboNotification -Post $post -SourceLabel "현재 forecast/Recent Movement 근거" -ClassificationConflict:$signalConflict
-    $seenSignals[$signalId] = $true
-    Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
-    Write-MonitorLog "Sent site-selected Tibo signal $signalId."
-}
-
-Save-WorkingState -SeenHistory $seenHistory -HistoryFingerprints $historyFingerprints -SeenSignals $seenSignals -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
-Write-MonitorLog "Check completed with no latestResetAt comparison."
+Save-WorkingState -SeenCompletedPosts $seenCompletedPosts -InitializedAt ([string]$state.initializedAt) -Score ([int]$forecast.forecast.score) -FetchedAt $forecast.fetchedAt
+Write-MonitorLog "Check completed; forecast, movement, proposal, announcement, and coupon alerts are disabled."
